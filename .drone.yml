@@ -1,0 +1,78 @@
+---
+kind: pipeline
+type: kubernetes
+name: default
+
+metadata:
+  namespace: drone
+  labels:
+    app: ents-cli
+  annotations:
+    iam.amazonaws.com/role: k8s-drone
+service_account_name: drone-build-sa
+
+environment:
+  RUST_VERSION: 1.68.1
+  DEBIAN_FRONTEND: noninteractive
+  AWS_REGION: us-west-2
+  CROSS_VERSION: 0.2.5
+  DOCKER_HOST: tcp://localhost:2375
+
+services:
+  - name: docker
+    image: docker:dind
+    privileged: true
+    entrypoint: ["dockerd", "--host=tcp://0.0.0.0:2375"] # work around for default TLS. I don't want to bother sharing the cert dir.
+
+workspace:
+  path: /root
+
+steps:
+  - name: cross-compile-all-targets
+    image: ubuntu:22.04
+    pull: always
+    resources:
+      cpu: 3700m
+      memory: 62000MiB
+    commands:
+      - apt-get update > /dev/null; apt-get install -y curl build-essential docker.io time > /dev/null
+      - curl -O https://ids-dev-artifacts.s3.amazonaws.com/ents-cli/0.3.3/ents-x86_64-unknown-linux-musl; chmod a+x ents-*; mv ents-* /usr/local/bin/ents
+      - ents ecr docker-login --stripe-group=ids --only=ids-dev
+      - time curl https://sh.rustup.rs -sSf | sh -s -- --default-toolchain=$RUST_VERSION --target x86_64-apple-darwin aarch64-apple-darwin -y
+      - . "$HOME/.cargo/env"
+      - cargo fmt --check
+      - time curl -LO --silent https://github.com/cross-rs/cross/releases/download/v$CROSS_VERSION/cross-x86_64-unknown-linux-gnu.tar.gz; tar xzf cross-*.tar.gz; mkdir -p ~/.cargo/bin; mv cross ~/.cargo/bin
+      - for TARGET in x86_64-unknown-linux-musl x86_64-apple-darwin aarch64-apple-darwin; do echo "==================\n===== WORKING ON $TARGET =====\n=================="; time cross build --target $TARGET --release; mv target/$TARGET/release/ents target/$TARGET/release/ents-$TARGET; done
+
+  - name: copy-to-s3
+    image: 539703851677.dkr.ecr.us-west-2.amazonaws.com/rust-musl:nightly-2021-12-08
+    when:
+      event: tag
+    pull: always
+    environment:
+      AWS_REGION: us-west-2
+    commands:
+      - for TGT in target/*/release/ents-*; do aws s3 cp --quiet --acl=public-read $TGT s3://ids-dev-artifacts/ents-cli/$DRONE_TAG/$(basename $TGT); done
+      - echo "Available with anonymous download from S3 (suitable for CI)" >> RELEASE_NOTES.md
+      - echo "---\n\n" >> RELEASE_NOTES.md
+      - echo "https://ids-dev-artifacts.s3.amazonaws.com/ents-cli/$DRONE_TAG/ents-x86_64-unknown-linux-musl" >> RELEASE_NOTES.md
+      - echo "https://ids-dev-artifacts.s3.amazonaws.com/ents-cli/$DRONE_TAG/ents-x86_64-apple-darwin" >> RELEASE_NOTES.md
+      - echo "https://ids-dev-artifacts.s3.amazonaws.com/ents-cli/$DRONE_TAG/ents-aarch64-apple-darwin" >> RELEASE_NOTES.md
+      - echo "$DRONE_TAG" > LATEST
+      - aws s3 cp --quiet --acl=public-read LATEST s3://ids-dev-artifacts/ents-cli/LATEST
+
+  - name: publish
+    image: plugins/github-release
+    when:
+      event: tag
+    settings:
+      api_key:
+        from_secret: GH_RELEASE_TOKEN
+      files:
+        - target/x86_64-unknown-linux-musl/release/ents-x86_64-unknown-linux-musl
+        - target/x86_64-apple-darwin/release/ents-x86_64-apple-darwin
+        - target/aarch64-apple-darwin/release/ents-aarch64-apple-darwin
+      base_url: https://git.viasat.com/api/v3
+      note: ./RELEASE_NOTES.md
+      overwrite: true
+      upload_url: https://git.viasat.com/api/uploads/ # https://git.viasat.com/api/uploads/repos/ents/ents-cli/releases/31366/assets

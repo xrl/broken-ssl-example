@@ -1,0 +1,5 @@
+[target.aarch64-apple-darwin]
+image = "539703851677.dkr.ecr.us-west-2.amazonaws.com/cross:aarch64-apple-darwin"
+
+[target.x86_64-apple-darwin]
+image = "539703851677.dkr.ecr.us-west-2.amazonaws.com/cross:x86_64-apple-darwin"
